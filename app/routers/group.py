@@ -25,15 +25,15 @@ async def handle_added(event: ChatMemberUpdated) -> None:
     if event.new_chat_member.user.is_bot and event.new_chat_member.user.id == event.bot.id:
         chat_id = event.chat.id
         payload = encode_deeplink_payload(chat_id)
+        url = f"https://t.me/{event.bot.username}?start={payload}"
         keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="Авторизоваться", url=f"https://t.me/{event.bot.username}?start={payload}")]]
+            inline_keyboard=[[InlineKeyboardButton(text="Авторизоваться", url=url)]]
         )
-        await event.bot.send_message(
-            chat_id,
+        text = (
             "Привет! Чтобы участвовать в отчётах, нужно пройти авторизацию.\n"
-            "Нажмите кнопку ниже — откроется личный чат со мной.",
-            reply_markup=keyboard,
+            "Нажмите кнопку ниже — откроется личный чат со мной."
         )
+        await event.bot.send_message(chat_id, text, reply_markup=keyboard)
         async with async_session_factory() as session:
             stmt = select(Chat).where(Chat.chat_id == chat_id)
             result = await session.execute(stmt)
