@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
-from datetime import UTC, datetime
-from typing import Any, Dict, List, Optional
+import random
+from datetime import datetime, timedelta
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -19,37 +29,55 @@ from telegram.ext import (
     filters,
 )
 
-from scheduler import init_scheduler
-from storage import Storage, Wish
+from storage import (
+    ChatMeta,
+    Wish,
+    count_stats,
+    create_wish,
+    delete_wish,
+    get_or_init_chat_meta,
+    get_wish,
+    list_chats,
+    list_wishes,
+    mark_done,
+    nearest_with_date,
+    random_open_wish,
+)
 from utils import (
-    SummaryData,
+    MOTIVATION_PHRASES,
+    RANDOM_IDEAS,
     TAG_OPTIONS,
+    TIME_HORIZON_OPTIONS,
     build_summary_text,
-    ensure_initial_ping,
+    format_draft_price,
+    format_draft_time,
+    format_random_idea,
     format_wish_caption,
     parse_due_date,
-    parse_filters,
     parse_price,
     tags_from_csv,
     toggle_tag,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
-logger = logging.getLogger(__name__)
-
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DEFAULT_TZ = os.getenv("TZ", "Europe/Sofia")
+DEFAULT_TZ = os.getenv("TZ", "Europe/Moscow")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Проверьте .env")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Создайте .env на основе .env.example")
 
-storage = Storage()
+ASK_TITLE, DETAILS = range(2)
+ADD_CONV_HANDLER: Optional[ConversationHandler] = None
+DRAFT_KEY = "new_wish"
 
-TITLE, OPTIONS = range(2)
-
-HORIZON_CODES = {
+TIME_CODES = {
     "NOW": "⚡ Прямо сейчас",
     "MONTH": "📆 Этот месяц",
     "YEAR": "📅 Этот год",
@@ -57,680 +85,865 @@ HORIZON_CODES = {
     "DATE": "🗓 Точная дата",
 }
 
-TAG_CODES = {f"TAG{i}": tag for i, tag in enumerate(TAG_OPTIONS)}
+BOTTOM_KEYBOARD = ReplyKeyboardMarkup(
+    [["➕ Добавить", "📋 Список"], ["🎲 Рандом", "🧾 Сводка"]],
+    resize_keyboard=True,
+)
 
-ADD_MAIN_TEXT = "Добавим детали? Всё опционально. Когда будете готовы — жмите ‘Сохранить’."
+
+def _end_conversation_for_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> None:
+    if ADD_CONV_HANDLER:
+        ADD_CONV_HANDLER.conversations[(chat_id, user_id)] = ConversationHandler.END
 
 
-def wish_keyboard(wish_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton("✅ Выполнено", callback_data=f"WISH:DONE:{wish_id}"),
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"WISH:DEL:{wish_id}"),
-        ],
-        [
-            InlineKeyboardButton("🏷 Теги", callback_data=f"WISH:TAGS:{wish_id}:MENU"),
-            InlineKeyboardButton("⏰ Когда", callback_data=f"WISH:WHEN:{wish_id}:MENU"),
-        ],
-    ]
+def wish_action_keyboard(wish_id: int, done: bool = False) -> InlineKeyboardMarkup:
+    if done:
+        buttons = [[InlineKeyboardButton("🗑 Удалить", callback_data=f"WISH:DEL:{wish_id}")]]
+    else:
+        buttons = [
+            [
+                InlineKeyboardButton("✅ Выполнено", callback_data=f"WISH:DONE:{wish_id}"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"WISH:DEL:{wish_id}"),
+            ]
+        ]
     return InlineKeyboardMarkup(buttons)
 
 
-def add_main_keyboard(temp: Dict[str, Any]) -> InlineKeyboardMarkup:
-    buttons = [
+def add_keyboard(draft: Dict[str, object]) -> InlineKeyboardMarkup:
+    menu = draft.get("menu", "main")
+    if menu == "price":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Есть", callback_data="ADD:PRICE:SET:YES"),
+                    InlineKeyboardButton("Нет", callback_data="ADD:PRICE:SET:NO"),
+                ],
+                [InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")],
+            ]
+        )
+    if menu == "when":
+        rows = [
+            [InlineKeyboardButton(label, callback_data=f"ADD:WHEN:SET:{code}")]
+            for code, label in TIME_CODES.items()
+        ]
+        rows.append([InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")])
+        return InlineKeyboardMarkup(rows)
+    if menu == "tags":
+        selected = set(tags_from_csv(draft.get("tags")))
+        rows = []
+        for index, tag in enumerate(TAG_OPTIONS):
+            flag = "✅" if tag in selected else "➕"
+            rows.append(
+                [InlineKeyboardButton(f"{flag} {tag}", callback_data=f"ADD:TAGS:TOGGLE:{index}")]
+            )
+        rows.append([InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")])
+        return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("➕ Фото", callback_data="ADD:PHOTO"),
-            InlineKeyboardButton("💰 Цена", callback_data="ADD:PRICE:MENU"),
-            InlineKeyboardButton("⏰ Когда", callback_data="ADD:WHEN:MENU"),
-        ],
-        [
-            InlineKeyboardButton("🏷 Теги", callback_data="ADD:TAGS:MENU"),
-            InlineKeyboardButton("✅ Сохранить", callback_data="ADD:SAVE"),
-        ],
-        [InlineKeyboardButton("🚫 Отмена", callback_data="ADD:CANCEL")],
+            [
+                InlineKeyboardButton("➕ Фото", callback_data="ADD:PHOTO"),
+                InlineKeyboardButton("💰 Цена", callback_data="ADD:PRICE:MENU"),
+                InlineKeyboardButton("⏰ Когда", callback_data="ADD:WHEN:MENU"),
+            ],
+            [InlineKeyboardButton("🏷 Теги", callback_data="ADD:TAGS:MENU"), InlineKeyboardButton("✅ Сохранить", callback_data="ADD:SAVE")],
+            [InlineKeyboardButton("🚫 Отмена", callback_data="ADD:CANCEL")],
+        ]
+    )
+
+
+def draft_preview_text(draft: Dict[str, object]) -> str:
+    title = html.escape(str(draft.get("title") or "—"))
+    photo = "Есть" if draft.get("photo_file_id") else "Нет"
+    price = format_draft_price(draft.get("price_flag"), draft.get("price_amount"))
+    when = format_draft_time(draft.get("time_horizon"), draft.get("due_date"))
+    tags = ", ".join(tags_from_csv(draft.get("tags"))) or "—"
+    parts = [
+        "<b>Черновик желания</b>",
+        f"Название: <b>{title}</b>",
+        f"Фото: {photo}",
+        f"Цена: {html.escape(str(price))}",
+        f"Когда: {html.escape(when)}",
+        f"Теги: {html.escape(tags)}",
     ]
-    return InlineKeyboardMarkup(buttons)
+    return "\n".join(parts)
 
 
-def add_price_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton("Есть", callback_data="ADD:PRICE:HAS"), InlineKeyboardButton("Нет", callback_data="ADD:PRICE:NOT")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+async def refresh_draft_message(context: ContextTypes.DEFAULT_TYPE, draft: Dict[str, object]) -> None:
+    message_id = draft.get("message_id")
+    chat_id = draft.get("message_chat_id")
+    if not message_id or not chat_id:
+        return
+    try:
+        await context.bot.edit_message_text(
+            text=draft_preview_text(draft),
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=add_keyboard(draft),
+        )
+    except BadRequest as exc:
+        logger.debug("Не удалось обновить черновик: %s", exc)
 
 
-def add_when_keyboard() -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for code, label in HORIZON_CODES.items():
-        rows.append([InlineKeyboardButton(label, callback_data=f"ADD:WHEN:SET:{code}")])
-    rows.append([InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")])
-    return InlineKeyboardMarkup(rows)
-
-
-def add_tags_keyboard(temp: Dict[str, Any]) -> InlineKeyboardMarkup:
-    selected = tags_from_csv(temp.get("tags"))
-    rows: List[List[InlineKeyboardButton]] = []
-    for code, tag in TAG_CODES.items():
-        flag = "✅" if tag in selected else "➕"
-        rows.append([InlineKeyboardButton(f"{flag} {tag}", callback_data=f"ADD:TAGS:TOGGLE:{code}")])
-    rows.append([InlineKeyboardButton("Готово", callback_data="ADD:BACK")])
-    return InlineKeyboardMarkup(rows)
-
-
-def add_tags_keyboard_wish(wish_id: int, wish: Wish) -> InlineKeyboardMarkup:
-    selected = tags_from_csv(wish.tags)
-    rows: List[List[InlineKeyboardButton]] = []
-    for code, tag in TAG_CODES.items():
-        flag = "✅" if tag in selected else "➕"
-        rows.append([InlineKeyboardButton(f"{flag} {tag}", callback_data=f"WISH:TAGS:{wish_id}:TOGGLE:{code}")])
-    rows.append([InlineKeyboardButton("Готово", callback_data=f"WISH:TAGS:{wish_id}:CLOSE")])
-    return InlineKeyboardMarkup(rows)
-
-
-def add_when_keyboard_wish(wish_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(label, callback_data=f"WISH:WHEN:{wish_id}:SET:{code}")] for code, label in HORIZON_CODES.items()]
-    rows.append([InlineKeyboardButton("Отмена", callback_data=f"WISH:WHEN:{wish_id}:CLOSE")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def ensure_chat_meta(chat_id: int) -> None:
-    meta = await asyncio.to_thread(storage.get_or_init_chat_meta, chat_id, DEFAULT_TZ)
-    if meta.next_ping_at is None:
-        now = datetime.now(UTC)
-        next_ping = ensure_initial_ping(now, meta.timezone)
-        await asyncio.to_thread(storage.update_chat_meta, chat_id, next_ping_at=next_ping)
+async def ensure_chat_meta(chat_id: int) -> ChatMeta:
+    return await asyncio.to_thread(get_or_init_chat_meta, chat_id, DEFAULT_TZ)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await ensure_chat_meta(chat_id)
     text = (
-        "Привет! Я тёплый wishlist-бот. Команда /add начнёт добавление желания."
-        " Всё, что мы записываем, остаётся внутри этого чата."
+        "Привет! Я романтичный wishlist-бот. Жмите «➕ Добавить», чтобы записать идею,"
+        " а /help подскажет команды."
     )
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text, reply_markup=BOTTOM_KEYBOARD)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat:
+        await ensure_chat_meta(update.effective_chat.id)
     text = (
         "Команды:\n"
         "/add — добавить новое желание\n"
-        "/list — список текущих желаний\n"
-        "/random — случайная идея\n"
-        "/done <id> — отметить выполненным\n"
-        "/delete <id> — удалить\n"
-        "/summary — сводка по чату"
+        "/list — показать текущий список\n"
+        "/random — идея из локального банка\n"
+        "/summary — короткая сводка\n"
+        "/done <id> — отметить выполненным (только админы)\n"
+        "/delete <id> — удалить (только админы)"
     )
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text, reply_markup=BOTTOM_KEYBOARD)
 
 
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("Как назовём желание? (до 120 символов)")
-    return TITLE
-
-
-async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("Хорошо, останавливаемся. Если появится идея — /add.")
-    return ConversationHandler.END
-
-
-async def edit_add_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    message_id = context.user_data.get("add_message_id")
-    if not message_id:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-        context.user_data["add_message_id"] = sent.message_id
-        return
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=keyboard,
-        )
-    except Exception:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-        context.user_data["add_message_id"] = sent.message_id
+async def add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    await ensure_chat_meta(chat_id)
+    draft = {
+        "chat_id": chat_id,
+        "title": None,
+        "photo_file_id": None,
+        "price_flag": None,
+        "price_amount": None,
+        "time_horizon": None,
+        "due_date": None,
+        "tags": "",
+        "awaiting": None,
+        "menu": "main",
+        "message_id": None,
+        "message_chat_id": None,
+    }
+    context.user_data[DRAFT_KEY] = draft
+    reply_markup = ForceReply(selective=True, input_field_placeholder="Название желания (до 120 символов)")
+    await update.effective_message.reply_text(
+        "Как назовём желание? Ответьте реплаем на это сообщение 💡",
+        reply_markup=reply_markup,
+    )
+    return ASK_TITLE
 
 
 async def add_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    title = (update.message.text or "").strip()
+    message = update.message
+    draft = context.user_data.get(DRAFT_KEY)
+    if not message or not draft:
+        return ConversationHandler.END
+    if not message.reply_to_message or message.reply_to_message.from_user.id != context.bot.id:
+        return ASK_TITLE
+    title = message.text.strip()
     if not title:
-        await update.message.reply_text("Нужно живое название. Попробуйте ещё раз.")
-        return TITLE
-    if len(title) > 120:
-        await update.message.reply_text("Давайте чуть короче (до 120 символов).")
-        return TITLE
-    context.user_data["new_wish"] = {
-        "title": title,
-        "photo_file_id": None,
-        "price_flag": False,
-        "price_amount": None,
-        "time_horizon": HORIZON_CODES["SOMEDAY"],
-        "due_date": None,
-        "tags": None,
-    }
-    await edit_add_message(context, update.effective_chat.id, ADD_MAIN_TEXT, add_main_keyboard(context.user_data["new_wish"]))
-    return OPTIONS
-
-
-async def restore_add_main(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    temp = context.user_data.get("new_wish", {})
-    await edit_add_message(context, chat_id, ADD_MAIN_TEXT, add_main_keyboard(temp))
-
-
-async def add_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    temp = context.user_data.get("new_wish")
-    if not temp:
-        await query.edit_message_text("Диалог истёк. Запустите /add заново.")
-        return ConversationHandler.END
-    chat_id = query.message.chat.id
-
-    if data == "ADD:PHOTO":
-        context.user_data["awaiting_photo"] = True
-        await edit_add_message(context, chat_id, "Пришлите фото. Можно пропустить.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")]]))
-        return OPTIONS
-    if data == "ADD:PRICE:MENU":
-        await edit_add_message(context, chat_id, "Есть ли ориентир по цене?", add_price_keyboard())
-        return OPTIONS
-    if data == "ADD:PRICE:HAS":
-        context.user_data["awaiting_price"] = True
-        await edit_add_message(
-            context,
-            chat_id,
-            "Напишите сумму (можно приблизительно). Если ничего не нужно — нажмите ‘Назад’.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data="ADD:PRICE:SKIP")], [InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")]]),
+        await message.reply_text(
+            "Нужно придумать название. Попробуйте ещё раз 💡",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Название желания"),
         )
-        return OPTIONS
-    if data == "ADD:PRICE:NOT":
-        temp["price_flag"] = False
-        temp["price_amount"] = None
-        context.user_data.pop("awaiting_price", None)
-        await restore_add_main(context, chat_id)
-        return OPTIONS
-    if data == "ADD:PRICE:SKIP":
-        temp["price_flag"] = True
-        temp["price_amount"] = None
-        context.user_data.pop("awaiting_price", None)
-        await restore_add_main(context, chat_id)
-        return OPTIONS
-    if data == "ADD:WHEN:MENU":
-        await edit_add_message(context, chat_id, "Когда хочется осуществить?", add_when_keyboard())
-        return OPTIONS
-    if data.startswith("ADD:WHEN:SET:"):
-        code = data.split(":")[-1]
-        label = HORIZON_CODES.get(code)
-        if not label:
-            await query.answer("Неизвестный вариант", show_alert=True)
-            return OPTIONS
-        temp["time_horizon"] = label
-        if code == "DATE":
-            context.user_data["awaiting_due"] = True
-            temp["due_date"] = None
-            await edit_add_message(
-                context,
-                chat_id,
-                "Напишите дату в формате YYYY-MM-DD.",
-                InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("Пропустить", callback_data="ADD:DUE:SKIP")],
-                        [InlineKeyboardButton("⬅ Назад", callback_data="ADD:BACK")],
-                    ]
-                ),
+        return ASK_TITLE
+    if len(title) > 120:
+        await message.reply_text(
+            "Название должно быть короче 120 символов. Давайте чуть компактнее ✂️",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Краткое название"),
+        )
+        return ASK_TITLE
+    draft["title"] = title
+    preview = draft_preview_text(draft)
+    keyboard = add_keyboard(draft)
+    sent = await message.reply_text(preview, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    draft["message_id"] = sent.message_id
+    draft["message_chat_id"] = sent.chat_id
+    return DETAILS
+
+
+async def add_handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get(DRAFT_KEY)
+    if not draft:
+        return ConversationHandler.END
+    if draft.get("awaiting") != "photo":
+        return DETAILS
+    message = update.message
+    if not message or not message.photo:
+        return DETAILS
+    photo = message.photo[-1]
+    draft["photo_file_id"] = photo.file_id
+    draft["awaiting"] = None
+    await message.reply_text("Фото добавлено. Красота! 📸")
+    await refresh_draft_message(context, draft)
+    return DETAILS
+
+
+async def add_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get(DRAFT_KEY)
+    if not draft:
+        return ConversationHandler.END
+    awaiting = draft.get("awaiting")
+    message = update.message
+    if message is None:
+        return DETAILS
+    text = message.text.strip() if message.text else ""
+    if awaiting == "price":
+        try:
+            parsed = parse_price(text)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return DETAILS
+        draft["price_flag"] = True
+        draft["price_amount"] = str(parsed)
+        draft["awaiting"] = None
+        await message.reply_text("Записала сумму 💸")
+        await refresh_draft_message(context, draft)
+        return DETAILS
+    if awaiting == "due_date":
+        try:
+            due = parse_due_date(text)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return DETAILS
+        draft["due_date"] = due
+        draft["time_horizon"] = TIME_CODES["DATE"]
+        draft["awaiting"] = None
+        await message.reply_text("Дата отмечена ✨")
+        await refresh_draft_message(context, draft)
+        return DETAILS
+    if awaiting == "photo":
+        await message.reply_text("Пришлите фото изображением, оно заменит текущее.")
+        return DETAILS
+    if text:
+        await message.reply_text("Используйте кнопки под черновиком, чтобы добавить детали.")
+    return DETAILS
+
+
+async def add_cancel(context: ContextTypes.DEFAULT_TYPE, draft: Dict[str, object]) -> None:
+    message_id = draft.get("message_id")
+    chat_id = draft.get("message_chat_id")
+    if message_id and chat_id:
+        try:
+            await context.bot.edit_message_text(
+                "Черновик отменён. До новых идей 💛",
+                chat_id=chat_id,
+                message_id=message_id,
             )
-            return OPTIONS
-        context.user_data.pop("awaiting_due", None)
-        temp["due_date"] = None
-        await restore_add_main(context, chat_id)
-        return OPTIONS
-    if data == "ADD:DUE:SKIP":
-        temp["due_date"] = None
-        context.user_data.pop("awaiting_due", None)
-        await restore_add_main(context, chat_id)
-        return OPTIONS
-    if data == "ADD:TAGS:MENU":
-        await edit_add_message(context, chat_id, "Выберите теги, можно несколько.", add_tags_keyboard(temp))
-        return OPTIONS
-    if data.startswith("ADD:TAGS:TOGGLE:"):
-        code = data.split(":")[-1]
-        tag = TAG_CODES.get(code)
-        if tag:
-            temp["tags"] = toggle_tag(temp.get("tags"), tag)
-            await edit_add_message(context, chat_id, "Выберите теги, можно несколько.", add_tags_keyboard(temp))
-        return OPTIONS
-    if data == "ADD:BACK":
-        context.user_data.pop("awaiting_price", None)
-        context.user_data.pop("awaiting_due", None)
-        context.user_data.pop("awaiting_photo", None)
-        await restore_add_main(context, chat_id)
-        return OPTIONS
-    if data == "ADD:SAVE":
-        wish = await save_new_wish(update, context, temp)
-        if wish:
-            await query.edit_message_text("Сохранила! Посмотрите карточку ниже.")
-            await send_wish_card(context, chat_id, wish)
-        context.user_data.clear()
-        return ConversationHandler.END
-    if data == "ADD:CANCEL":
-        await query.edit_message_text("Хорошо, отменяем. Возвращайтесь с новой идеей.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    return OPTIONS
+        except BadRequest:
+            pass
+    context.user_data.pop(DRAFT_KEY, None)
 
 
-async def save_new_wish(update: Update, context: ContextTypes.DEFAULT_TYPE, temp: Dict[str, Any]) -> Optional[Wish]:
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+async def add_save(query_update: Update, context: ContextTypes.DEFAULT_TYPE, draft: Dict[str, object]) -> None:
+    query = query_update.callback_query
+    if not draft.get("title"):
+        await query.answer(
+            "Нужно придумать название. Без него идея не сохранится 💡",
+            show_alert=True,
+        )
+        return
+    chat_id = draft["chat_id"]
+    user = query.from_user
     wish = await asyncio.to_thread(
-        storage.create_wish,
+        create_wish,
         chat_id=chat_id,
         user_id=user.id,
-        user_username=user.username,
         user_first_name=user.first_name,
-        title=temp["title"],
-        photo_file_id=temp.get("photo_file_id"),
-        price_flag=temp.get("price_flag", False),
-        price_amount=temp.get("price_amount"),
-        time_horizon=temp.get("time_horizon"),
-        due_date=temp.get("due_date"),
-        tags=temp.get("tags"),
+        user_username=user.username,
+        title=str(draft["title"]),
+        photo_file_id=draft.get("photo_file_id"),
+        price_flag=draft.get("price_flag"),
+        price_amount=draft.get("price_amount"),
+        time_horizon=draft.get("time_horizon"),
+        due_date=draft.get("due_date"),
+        tags=draft.get("tags") or None,
     )
-    return wish
 
-
-async def add_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not context.user_data.get("awaiting_photo"):
-        return OPTIONS
-    temp = context.user_data.get("new_wish")
-    if not temp:
-        await update.message.reply_text("Диалог завершён. Начните заново с /add.")
-        return ConversationHandler.END
-    photo = update.message.photo[-1]
-    temp["photo_file_id"] = photo.file_id
-    context.user_data.pop("awaiting_photo", None)
-    await update.message.reply_text("Фото добавлено.")
-    await restore_add_main(context, update.effective_chat.id)
-    return OPTIONS
-
-
-async def add_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    temp = context.user_data.get("new_wish")
-    if not temp:
-        await update.message.reply_text("Диалог завершён. Запустите /add снова.")
-        return ConversationHandler.END
-    if context.user_data.get("awaiting_price"):
+    message_id = draft.get("message_id")
+    message_chat_id = draft.get("message_chat_id")
+    if message_id and message_chat_id:
         try:
-            amount = parse_price(update.message.text)
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-            return OPTIONS
-        temp["price_flag"] = True
-        temp["price_amount"] = amount
-        context.user_data.pop("awaiting_price", None)
-        await update.message.reply_text("Записала цену.")
-        await restore_add_main(context, update.effective_chat.id)
-        return OPTIONS
-    if context.user_data.get("awaiting_due"):
-        try:
-            due = parse_due_date(update.message.text)
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-            return OPTIONS
-        temp["due_date"] = due
-        context.user_data.pop("awaiting_due", None)
-        await update.message.reply_text("Дата сохранена.")
-        await restore_add_main(context, update.effective_chat.id)
-        return OPTIONS
-    await update.message.reply_text("Если хотите изменить название, начните заново с /add.")
-    return OPTIONS
+            await context.bot.edit_message_reply_markup(chat_id=message_chat_id, message_id=message_id, reply_markup=None)
+        except BadRequest:
+            pass
+    context.user_data.pop(DRAFT_KEY, None)
 
-
-async def update_card_message(message, wish: Wish, keyboard: Optional[InlineKeyboardMarkup] = None) -> None:
     caption = format_wish_caption(wish)
-    keyboard = keyboard or wish_keyboard(wish.id)
-    if message.photo:
-        await message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await message.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
-
-async def edit_card_by_ids(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, wish: Wish, has_photo: bool, keyboard: Optional[InlineKeyboardMarkup] = None) -> None:
-    caption = format_wish_caption(wish)
-    keyboard = keyboard or wish_keyboard(wish.id)
-    if has_photo:
-        await context.bot.edit_message_caption(
+    keyboard = wish_action_keyboard(wish.id)
+    if wish.photo_file_id:
+        await context.bot.send_photo(
             chat_id=chat_id,
-            message_id=message_id,
+            photo=wish.photo_file_id,
             caption=caption,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
     else:
-        await context.bot.edit_message_text(
+        await context.bot.send_message(
             chat_id=chat_id,
-            message_id=message_id,
             text=caption,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
 
+    _end_conversation_for_user(context, chat_id, user.id)
 
-async def send_wish_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, wish: Wish, message=None) -> None:
-    caption = format_wish_caption(wish)
-    keyboard = wish_keyboard(wish.id)
-    if message:
-        await update_card_message(message, wish, keyboard)
+    await query.answer("Желание сохранено ✨")
+
+
+async def add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    draft = context.user_data.get(DRAFT_KEY)
+    if not draft:
+        await query.answer("Черновик не найден. Начните заново через /add.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
         return
-    if wish.photo_file_id:
-        await context.bot.send_photo(chat_id=chat_id, photo=wish.photo_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    data = query.data.split(":")
+    if len(data) < 2:
+        await query.answer()
+        return
+
+    action = data[1]
+
+    if action == "PHOTO":
+        draft["awaiting"] = "photo"
+        draft["menu"] = "main"
+        await refresh_draft_message(context, draft)
+        if query.message:
+            await query.message.reply_text(
+                "Пришлите одно фото отдельным сообщением — оно попадёт в карточку. 📸"
+            )
+        await query.answer("Жду фото 📸")
+        return
+
+    if action == "PRICE":
+        if len(data) == 3 and data[2] == "MENU":
+            draft["menu"] = "price"
+            await refresh_draft_message(context, draft)
+            await query.answer()
+            return
+        if len(data) == 4 and data[2] == "SET":
+            choice = data[3]
+            if choice == "YES":
+                draft["price_flag"] = True
+                draft["price_amount"] = None
+                draft["awaiting"] = "price"
+                draft["menu"] = "main"
+                await refresh_draft_message(context, draft)
+                if query.message:
+                    await query.message.reply_text("Напишите сумму или ориентир стоимости 💸")
+                await query.answer("Введите сумму")
+                return
+            if choice == "NO":
+                draft["price_flag"] = False
+                draft["price_amount"] = None
+                draft["awaiting"] = None
+                draft["menu"] = "main"
+                await refresh_draft_message(context, draft)
+                await query.answer("Отмечено: без бюджета")
+                return
+
+    if action == "WHEN":
+        if len(data) == 3 and data[2] == "MENU":
+            draft["menu"] = "when"
+            await refresh_draft_message(context, draft)
+            await query.answer()
+            return
+        if len(data) == 4 and data[2] == "SET":
+            code = data[3]
+            label = TIME_CODES.get(code)
+            if not label:
+                await query.answer()
+                return
+            draft["time_horizon"] = label
+            draft["menu"] = "main"
+            if code == "DATE":
+                draft["due_date"] = None
+                draft["awaiting"] = "due_date"
+                await refresh_draft_message(context, draft)
+                if query.message:
+                    await query.message.reply_text("Введите дату в формате YYYY-MM-DD.")
+                await query.answer("Жду дату")
+                return
+            draft["due_date"] = None
+            draft["awaiting"] = None
+            await refresh_draft_message(context, draft)
+            await query.answer("Срок обновлён")
+            return
+
+    if action == "TAGS":
+        if len(data) == 3 and data[2] == "MENU":
+            draft["menu"] = "tags"
+            await refresh_draft_message(context, draft)
+            await query.answer()
+            return
+        if len(data) == 4 and data[2] == "TOGGLE":
+            try:
+                index = int(data[3])
+            except ValueError:
+                await query.answer()
+                return
+            if 0 <= index < len(TAG_OPTIONS):
+                tag = TAG_OPTIONS[index]
+                draft["tags"] = toggle_tag(draft.get("tags"), tag)
+                await refresh_draft_message(context, draft)
+                active = tag in tags_from_csv(draft.get("tags"))
+                await query.answer("Тег добавлен" if active else "Тег убран")
+                return
+            await query.answer()
+            return
+
+    if action == "SAVE":
+        await add_save(update, context, draft)
+        return
+
+    if action == "CANCEL":
+        await add_cancel(context, draft)
+        if update.effective_chat and update.effective_user:
+            _end_conversation_for_user(
+                context, update.effective_chat.id, update.effective_user.id
+            )
+        await query.answer("Черновик отменён")
+        return
+
+    if action == "BACK":
+        draft["menu"] = "main"
+        await refresh_draft_message(context, draft)
+        await query.answer()
+        return
+
+    await query.answer()
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    filters = parse_filters(context.args or [])
-    context.chat_data["list_filters"] = filters
-    try:
-        page = int(filters.get("page", "1"))
-    except ValueError:
-        page = 1
-    await send_list_page(update.message.chat.id, update, context, page=page)
+    await send_list_page(update, context, page=0)
 
 
-async def send_list_page(chat_id: int, update_or_query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-    filters = context.chat_data.get("list_filters", {})
-    status = filters.get("status")
-    horizon = filters.get("horizon")
-    limit = 10
-    offset = (page - 1) * limit
-    wishes, total = await asyncio.to_thread(
-        storage.list_wishes,
-        chat_id=chat_id,
-        status=status,
-        time_horizon=horizon,
-        limit=limit,
-        offset=offset,
-    )
-    if not wishes:
-        text = "Пока пусто. Добавьте что-то через /add."
-        if isinstance(update_or_query, Update) and update_or_query.message:
-            await update_or_query.message.reply_text(text)
-        else:
-            await update_or_query.edit_message_text(text)
-        return
-    text_lines = [f"Страница {page}. Всего {total} записей."]
+def build_list_text(wishes: list[Wish], page: int, total: int, per_page: int) -> str:
+    if not total:
+        return "Пока пусто. Добавить через /add или кнопку «➕ Добавить»."
+    lines = ["<b>Список желаний</b>"]
     for wish in wishes:
-        text_lines.append(f"#{wish.id} — {wish.title} ({wish.time_horizon})")
-    buttons: List[InlineKeyboardButton] = []
-    if page > 1:
-        buttons.append(InlineKeyboardButton("« Назад", callback_data=f"LIST:PAGE:{page-1}"))
-    if offset + limit < total:
-        buttons.append(InlineKeyboardButton("Дальше »", callback_data=f"LIST:PAGE:{page+1}"))
-    markup = InlineKeyboardMarkup([buttons]) if buttons else None
-    if isinstance(update_or_query, Update) and update_or_query.message:
-        await update_or_query.message.reply_text("\n".join(text_lines), reply_markup=markup)
-    else:
-        await update_or_query.edit_message_text("\n".join(text_lines), reply_markup=markup)
+        horizon = wish.time_horizon or "Без срока"
+        if wish.due_date:
+            horizon = f"{horizon} — {wish.due_date.isoformat()}"
+        lines.append(f"#{wish.id} — {html.escape(wish.title)} ({html.escape(horizon)})")
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    lines.append(f"Стр. {page + 1} из {total_pages}")
+    return "\n".join(lines)
 
 
-async def list_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def list_keyboard(page: int, total: int, per_page: int) -> Optional[InlineKeyboardMarkup]:
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    if total_pages <= 1:
+        return None
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("« Назад", callback_data=f"LIST:{page - 1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Дальше »", callback_data=f"LIST:{page + 1}"))
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+async def send_list_page(update_or_query: Update, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    chat = update_or_query.effective_chat
+    if not chat:
+        return
+    chat_id = chat.id
+    await ensure_chat_meta(chat_id)
+    per_page = 10
+    wishes, total = await asyncio.to_thread(list_wishes, chat_id, "open", None, per_page, page * per_page)
+    text = build_list_text(wishes, page, total, per_page)
+    keyboard = list_keyboard(page, total, per_page)
+    if update_or_query.callback_query:
+        try:
+            await update_or_query.callback_query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except BadRequest:
+            pass
+        return
+    await update_or_query.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    page = int(query.data.split(":")[-1])
-    await send_list_page(query.message.chat.id, query, context, page)
-
-
-async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    wish = await asyncio.to_thread(storage.random_open_wish, chat_id)
-    if not wish:
-        await update.message.reply_text("Пока нет открытых желаний. /add спасёт ситуацию.")
+    try:
+        page = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
         return
-    await send_wish_card(context, chat_id, wish)
+    await send_list_page(update, context, page)
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    stats = await asyncio.to_thread(storage.count_stats, chat_id)
-    random_wish = await asyncio.to_thread(storage.random_open_wish, chat_id)
-    nearest = await asyncio.to_thread(storage.nearest_with_date, chat_id)
-    summary = SummaryData(
-        total=stats.get("total", 0),
-        by_horizon=stats.get("by_horizon", {}),
-        nearest=nearest,
-        random_wish=random_wish,
+    chat = update.effective_chat
+    if not chat:
+        return
+    chat_id = chat.id
+    await ensure_chat_meta(chat_id)
+    stats_task = asyncio.to_thread(count_stats, chat_id)
+    nearest_task = asyncio.to_thread(nearest_with_date, chat_id)
+    random_task = asyncio.to_thread(random_open_wish, chat_id)
+    stats, nearest, random_wish_obj = await asyncio.gather(
+        stats_task, nearest_task, random_task
     )
-    await update.message.reply_text(build_summary_text(summary))
+    payload = {
+        "total_open": stats.get("total_open", 0),
+        "by_horizon": stats.get("by_horizon", {}),
+        "nearest": nearest,
+        "random": random_wish_obj,
+        "motivation": random.choice(MOTIVATION_PHRASES),
+    }
+    text = build_summary_text(payload)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def random_keyboard(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("❤️ Берём", callback_data=f"RAND:TAKE:{index}")],
+            [InlineKeyboardButton("🔁 Дай другое", callback_data="RAND:NEXT")],
+            [InlineKeyboardButton("🚫 Закрыть", callback_data="RAND:CLOSE")],
+        ]
+    )
+
+
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat:
+        await ensure_chat_meta(chat.id)
+    index = random.randrange(len(RANDOM_IDEAS))
+    idea = RANDOM_IDEAS[index]
+    text = format_random_idea(idea)
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=random_keyboard(index),
+    )
+
+
+async def random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "NEXT":
+        index = random.randrange(len(RANDOM_IDEAS))
+        text = format_random_idea(RANDOM_IDEAS[index])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=random_keyboard(index))
+        await query.answer("Вот ещё идея! ✨")
+        return
+    if action == "CLOSE":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.answer("Закрыто")
+        return
+    if action == "TAKE":
+        try:
+            index = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("Что-то пошло не так", show_alert=True)
+            return
+        idea = RANDOM_IDEAS[index]
+        if not query.message or not query.message.chat:
+            await query.answer("Не удалось определить чат", show_alert=True)
+            return
+        chat_id = query.message.chat.id
+        await ensure_chat_meta(chat_id)
+        user = query.from_user
+        tags_csv = ",".join(idea.get("tags", [])) or None
+        wish = await asyncio.to_thread(
+            create_wish,
+            chat_id=chat_id,
+            user_id=user.id,
+            user_first_name=user.first_name,
+            user_username=user.username,
+            title=str(idea["title"]),
+            photo_file_id=None,
+            price_flag=False,
+            price_amount=None,
+            time_horizon=idea.get("default_horizon"),
+            due_date=None,
+            tags=tags_csv,
+        )
+        caption = format_wish_caption(wish)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=wish_action_keyboard(wish.id),
+        )
+        await query.answer("Добавила в список ❤️")
+        return
+
+
+async def wish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        await query.answer()
+        return
+    action, wish_id_raw = parts[1], parts[2]
+    try:
+        wish_id = int(wish_id_raw)
+    except ValueError:
+        await query.answer()
+        return
+    if not query.message or not query.message.chat:
+        await query.answer("Не удалось определить чат", show_alert=True)
+        return
+    chat = query.message.chat
+    chat_id = chat.id
+    user_id = query.from_user.id
+    if not await user_can_manage(chat_id, user_id, context, chat.type):
+        await query.answer("Только администраторы могут это делать.", show_alert=True)
+        return
+    if action == "DONE":
+        wish = await asyncio.to_thread(mark_done, wish_id)
+        if not wish or wish.chat_id != chat_id:
+            await query.answer("Запись не найдена", show_alert=True)
+            return
+        caption = format_wish_caption(wish)
+        keyboard = wish_action_keyboard(wish.id, done=True)
+        if query.message.photo:
+            await query.edit_message_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        else:
+            await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.answer("Готово! 💫")
+    elif action == "DEL":
+        ok = await asyncio.to_thread(delete_wish, wish_id)
+        if not ok:
+            await query.answer("Не получилось удалить", show_alert=True)
+            return
+        try:
+            await query.message.delete()
+        except (BadRequest, Forbidden):
+            await query.edit_message_text("Запись удалена.")
+        await query.answer("Удалено 🗑")
+    else:
+        await query.answer()
+
+
+async def user_can_manage(
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_type: Optional[str] = None,
+) -> bool:
+    if chat_type is None:
+        try:
+            chat = await context.bot.get_chat(chat_id)
+        except Exception:
+            return False
+        chat_type = chat.type
+
+    if chat_type == "private":
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    return member.status in {"creator", "administrator"}
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Укажите id: /done 3")
+        await update.effective_message.reply_text("Использование: /done <id>")
         return
     try:
         wish_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом")
+        await update.effective_message.reply_text("ID должен быть числом.")
         return
-    wish = await asyncio.to_thread(storage.mark_done, wish_id)
-    if not wish:
-        await update.message.reply_text("Не нашла такое желание.")
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
         return
-    await update.message.reply_text("Готово! Желание отмечено выполненным.")
+    chat_id = chat.id
+    await ensure_chat_meta(chat_id)
+    if not await user_can_manage(chat_id, user.id, context, chat.type):
+        await update.effective_message.reply_text("Только администраторы могут отмечать выполненным.")
+        return
+    wish = await asyncio.to_thread(mark_done, wish_id)
+    if not wish or wish.chat_id != chat_id:
+        await update.effective_message.reply_text("Желание не найдено в этом чате.")
+        return
+    await update.effective_message.reply_text(f"Желание #{wish.id} отмечено выполненным ✅")
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Укажите id: /delete 3")
+        await update.effective_message.reply_text("Использование: /delete <id>")
         return
     try:
         wish_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом")
+        await update.effective_message.reply_text("ID должен быть числом.")
         return
-    ok = await asyncio.to_thread(storage.delete_wish, wish_id)
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+    chat_id = chat.id
+    await ensure_chat_meta(chat_id)
+    if not await user_can_manage(chat_id, user.id, context, chat.type):
+        await update.effective_message.reply_text("Только администраторы могут удалять желания.")
+        return
+    ok = await asyncio.to_thread(delete_wish, wish_id)
     if not ok:
-        await update.message.reply_text("Не нашла такое желание.")
+        await update.effective_message.reply_text("Запись не найдена.")
         return
-    await update.message.reply_text("Удалено.")
+    await update.effective_message.reply_text(f"Желание #{wish_id} удалено 🗑")
 
 
-async def wish_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    wish = await asyncio.to_thread(storage.mark_done, wish_id)
-    if not wish:
-        await query.edit_message_text("Это желание уже исчезло.")
-        return
-    await update_card_message(query.message, wish)
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip()
+    if text == "📋 Список":
+        await list_command(update, context)
+    elif text == "🎲 Рандом":
+        await random_command(update, context)
+    elif text == "🧾 Сводка":
+        await summary_command(update, context)
 
 
-async def wish_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    ok = await asyncio.to_thread(storage.delete_wish, wish_id)
-    if not ok:
-        await query.edit_message_text("Желание уже удалено.")
-        return
-    if context.user_data.get("edit_due_wish") == wish_id:
-        context.user_data.pop("edit_due_wish", None)
-        context.user_data.pop("edit_due_message", None)
-    if query.message.photo:
-        await query.edit_message_caption(caption="Удалено.", reply_markup=None)
-    else:
-        await query.edit_message_text("Удалено.", reply_markup=None)
+async def add_job_biweekly(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chats = await asyncio.to_thread(list_chats)
+    now = datetime.utcnow()
+    for chat in chats:
+        last_added = chat.last_added_at or chat.created_at
+        if not last_added or now - last_added >= timedelta(days=14):
+            idea = random.choice(RANDOM_IDEAS)
+            text = (
+                "Вы классные 💞 Добавим маленькую хотелку? ✨\n"
+                f"• {idea['title']} — {idea['description']}"
+            )
+            try:
+                await context.bot.send_message(chat.chat_id, text)
+            except Exception as exc:  # pragma: no cover - уведомления должны быть мягкими
+                logger.debug("Не удалось отправить напоминание: %s", exc)
 
 
-async def wish_when_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Не нашла такое желание.")
-        return
-    await query.edit_message_reply_markup(reply_markup=add_when_keyboard_wish(wish_id))
-
-
-async def wish_when_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    wish_id = int(parts[2])
-    code = parts[4]
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Не нашла такое желание.")
-        return
-    label = HORIZON_CODES.get(code)
-    if not label:
-        await query.answer("Неизвестный вариант", show_alert=True)
-        return
-    if code == "DATE":
-        context.user_data["edit_due_wish"] = wish_id
-        context.user_data["edit_due_message"] = (
-            query.message.chat.id,
-            query.message.message_id,
-            bool(query.message.photo),
+async def add_job_monthly(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chats = await asyncio.to_thread(list_chats)
+    for chat in chats:
+        stats_task = asyncio.to_thread(count_stats, chat.chat_id)
+        nearest_task = asyncio.to_thread(nearest_with_date, chat.chat_id)
+        random_task = asyncio.to_thread(random_open_wish, chat.chat_id)
+        stats, nearest, random_wish_obj = await asyncio.gather(
+            stats_task, nearest_task, random_task
         )
-        await query.message.reply_text("Напишите дату YYYY-MM-DD для этого желания.")
-        return
-    context.user_data.pop("edit_due_wish", None)
-    context.user_data.pop("edit_due_message", None)
-    await asyncio.to_thread(storage.update_wish, wish_id, time_horizon=label, due_date=None)
-    updated = await asyncio.to_thread(storage.get_wish, wish_id)
-    await update_card_message(query.message, updated)
-
-
-async def wish_when_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Это желание уже удалено.")
-        return
-    context.user_data.pop("edit_due_wish", None)
-    context.user_data.pop("edit_due_message", None)
-    await update_card_message(query.message, wish)
-
-
-async def wish_tags_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Желание уже исчезло.")
-        return
-    await query.edit_message_reply_markup(reply_markup=add_tags_keyboard_wish(wish_id, wish))
-
-
-async def wish_tags_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    wish_id = int(parts[2])
-    code = parts[4]
-    tag = TAG_CODES.get(code)
-    if not tag:
-        await query.answer("Неизвестный тег", show_alert=True)
-        return
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Желание уже исчезло.")
-        return
-    new_tags = toggle_tag(wish.tags, tag)
-    await asyncio.to_thread(storage.update_wish, wish_id, tags=new_tags)
-    updated = await asyncio.to_thread(storage.get_wish, wish_id)
-    await update_card_message(query.message, updated, add_tags_keyboard_wish(wish_id, updated))
-
-
-async def wish_tags_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    wish_id = int(query.data.split(":")[2])
-    wish = await asyncio.to_thread(storage.get_wish, wish_id)
-    if not wish:
-        await query.edit_message_text("Желание уже удалено.")
-        return
-    await update_card_message(query.message, wish)
-
-
-async def global_text_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.user_data.get("edit_due_wish"):
-        wish_id = context.user_data.pop("edit_due_wish")
-        message_info = context.user_data.pop("edit_due_message", None)
+        header = (
+            f"У вас уже {stats.get('total_open', 0)} тёплых планов 💖"
+            if stats.get("total_open", 0)
+            else "Пока в списке пусто — самое время добавить что-то доброе!"
+        )
+        payload = {
+            "total_open": stats.get("total_open", 0),
+            "by_horizon": stats.get("by_horizon", {}),
+            "nearest": nearest,
+            "random": random_wish_obj,
+            "motivation": random.choice(MOTIVATION_PHRASES),
+        }
+        body = build_summary_text(payload)
         try:
-            due = parse_due_date(update.message.text)
-        except ValueError as exc:
-            await update.message.reply_text(str(exc))
-            context.user_data["edit_due_wish"] = wish_id
-            if message_info:
-                context.user_data["edit_due_message"] = message_info
-            return
-        await asyncio.to_thread(storage.update_wish, wish_id, time_horizon=HORIZON_CODES["DATE"], due_date=due)
-        updated = await asyncio.to_thread(storage.get_wish, wish_id)
-        await update.message.reply_text("Дата обновлена.")
-        if message_info:
-            chat_id, message_id, has_photo = message_info
-            await edit_card_by_ids(context, chat_id, message_id, updated, has_photo)
-        else:
-            await send_wish_card(context, update.effective_chat.id, updated)
+            await context.bot.send_message(
+                chat.chat_id,
+                f"{header}\n\n{body}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.debug("Не удалось отправить ежемесячную сводку: %s", exc)
 
 
-def build_application():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Произошла ошибка при обработке апдейта: %s", context.error)
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add", add_command)],
-        states={
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive_title)],
-            OPTIONS: [
-                CallbackQueryHandler(add_handle_callback, pattern=r"^ADD:"),
-                MessageHandler(filters.PHOTO, add_receive_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive_text),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_add)],
-        name="add_conversation",
-        persistent=False,
+
+async def post_init(application: Application) -> None:
+    application.job_queue.run_repeating(
+        add_job_biweekly,
+        interval=14 * 24 * 60 * 60,
+        first=60,
+        name="biweekly_reminder",
+        misfire_grace_time=300,
+    )
+    application.job_queue.run_repeating(
+        add_job_monthly,
+        interval=30 * 24 * 60 * 60,
+        first=120,
+        name="monthly_summary",
+        misfire_grace_time=300,
+    )
+
+
+def build_application() -> Application:
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .parse_mode(ParseMode.HTML)
+        .post_init(post_init)
+        .build()
     )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(conv_handler)
+
+    global ADD_CONV_HANDLER
+    ADD_CONV_HANDLER = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_entry),
+            MessageHandler(filters.Regex(r"^➕ Добавить$"), add_entry),
+        ],
+        states={
+            ASK_TITLE: [MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, add_receive_title)],
+            DETAILS: [
+                MessageHandler(filters.PHOTO, add_handle_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_handle_text),
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+        per_chat=True,
+        per_user=True,
+    )
+    application.add_handler(ADD_CONV_HANDLER)
+
+    application.add_handler(CallbackQueryHandler(add_callback, pattern=r"^ADD:"))
+    application.add_handler(MessageHandler(filters.Regex(r"^(📋 Список|🎲 Рандом|🧾 Сводка)$"), handle_menu_buttons))
+
     application.add_handler(CommandHandler("list", list_command))
-    application.add_handler(CallbackQueryHandler(list_pagination, pattern=r"^LIST:PAGE:"))
     application.add_handler(CommandHandler("random", random_command))
     application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(CommandHandler("delete", delete_command))
-    application.add_handler(CallbackQueryHandler(wish_done_callback, pattern=r"^WISH:DONE:"))
-    application.add_handler(CallbackQueryHandler(wish_delete_callback, pattern=r"^WISH:DEL:"))
-    application.add_handler(CallbackQueryHandler(wish_when_menu, pattern=r"^WISH:WHEN:.*:MENU$"))
-    application.add_handler(CallbackQueryHandler(wish_when_set, pattern=r"^WISH:WHEN:\d+:SET:"))
-    application.add_handler(CallbackQueryHandler(wish_when_close, pattern=r"^WISH:WHEN:\d+:CLOSE$"))
-    application.add_handler(CallbackQueryHandler(wish_tags_menu, pattern=r"^WISH:TAGS:.*:MENU$"))
-    application.add_handler(CallbackQueryHandler(wish_tags_toggle, pattern=r"^WISH:TAGS:\d+:TOGGLE:"))
-    application.add_handler(CallbackQueryHandler(wish_tags_close, pattern=r"^WISH:TAGS:\d+:CLOSE$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_text_listener))
 
+    application.add_handler(CallbackQueryHandler(list_callback, pattern=r"^LIST:"))
+    application.add_handler(CallbackQueryHandler(random_callback, pattern=r"^RAND:"))
+    application.add_handler(CallbackQueryHandler(wish_callback, pattern=r"^WISH:"))
+
+    application.add_error_handler(error_handler)
     return application
 
 
 def main() -> None:
     application = build_application()
-    init_scheduler(application, storage)
-    logger.info("Бот запускается…")
     application.run_polling()
 
 
